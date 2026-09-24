@@ -1,37 +1,34 @@
 """
-Step 2: send every prompt to every model, save responses, then build blind A/B pairs.
+Step 2 (manual mode): collect responses by copy-pasting from the chat apps,
+then build blind A/B pairs for annotation. No API key needed.
 
 Usage:
-    pip install openai
-    python run_models.py            # call the real APIs
-    python run_models.py --dry-run  # fake responses, to test the pipeline
+    python run_models.py template   # create/extend responses.csv with empty rows to fill
+    python run_models.py status     # show how many responses are still missing
+    python run_models.py pairs      # build pairs.csv + pairs_key.csv once everything is filled
 
-Outputs:
-    responses.csv   one row per (prompt, model)
-    pairs.csv       blind pairs for you to annotate (no model names)
-    pairs_key.csv   which model is A / B in each pair (don't open while annotating)
+How to fill responses.csv:
+    - Open it in Google Sheets or Excel. Rows are grouped by model, so you can
+      work through one app at a time.
+    - For each row: open a NEW chat in that app, paste the 'prompt' cell exactly,
+      copy the whole answer back into the 'response' cell.
+    - Multi-line answers: in Excel double-click the cell (or use the formula bar)
+      before pasting, otherwise the text spreads over several rows.
+      Google Sheets: select the cell and paste normally.
+    - Save/download as CSV (UTF-8), keep the name responses.csv.
 """
 import csv
 import itertools
 import os
 import random
 import sys
-import time
 
-# Fill in the models you want to compare. Any OpenAI-compatible endpoint works
-# (OpenAI, Gemini's OpenAI-compatible endpoint, OpenRouter, Groq, local Ollama...).
-# Check each provider's docs for the current base_url and model name.
-MODELS = [
-    {"name": "model_1", "base_url": "https://api.openai.com/v1",
-     "api_key_env": "OPENAI_API_KEY", "model": "FILL_ME"},
-    {"name": "model_2", "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-     "api_key_env": "GEMINI_API_KEY", "model": "FILL_ME"},
-    {"name": "model_3", "base_url": "http://localhost:11434/v1",  # Ollama
-     "api_key_env": None, "model": "FILL_ME"},
-]
+# Names used in the 'model' column. Change them if you compare other models.
+MODELS = ["claude", "gemini", "chatgpt"]
 
 PROMPTS_FILE = "prompts.csv"
 RESPONSES_FILE = "responses.csv"
+FIELDS = ["prompt_id", "category", "model", "prompt", "response"]
 SEED = 42
 
 
@@ -43,79 +40,86 @@ def read_csv(path):
 def write_csv(path, rows, fields):
     # utf-8-sig so Excel shows Vietnamese correctly
     with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=fields)
+        w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
         w.writeheader()
         w.writerows(rows)
 
 
-def ask(cfg, prompt, dry_run):
-    if dry_run:
-        return f"[dry-run answer from {cfg['name']}] {prompt[:40]}..."
-    from openai import OpenAI
-    key = os.environ.get(cfg["api_key_env"]) if cfg["api_key_env"] else "none"
-    client = OpenAI(base_url=cfg["base_url"], api_key=key)
-    for attempt in range(3):
-        try:
-            r = client.chat.completions.create(
-                model=cfg["model"],
-                messages=[{"role": "user", "content": prompt}],
-            )
-            return r.choices[0].message.content.strip()
-        except Exception as e:  # rate limits, timeouts...
-            print(f"  error ({cfg['name']}, attempt {attempt + 1}): {e}")
-            time.sleep(5 * (attempt + 1))
-    return "[ERROR]"
+def load_responses():
+    if not os.path.exists(RESPONSES_FILE):
+        return {}
+    return {(r["prompt_id"], r["model"]): r for r in read_csv(RESPONSES_FILE)}
 
 
-def main():
-    dry_run = "--dry-run" in sys.argv
+def template():
     prompts = read_csv(PROMPTS_FILE)
+    existing = load_responses()
+    rows, added = [], 0
+    for m in MODELS:                      # grouped by model = one app at a time
+        for p in prompts:
+            k = (p["id"], m)
+            if k in existing:
+                r = existing[k]
+                r["prompt"] = p["prompt"]  # keep prompt text in sync with prompts.csv
+                rows.append(r)
+            else:
+                rows.append({"prompt_id": p["id"], "category": p["category"],
+                             "model": m, "prompt": p["prompt"], "response": ""})
+                added += 1
+    write_csv(RESPONSES_FILE, rows, FIELDS)
+    print(f"{RESPONSES_FILE}: {len(rows)} rows ({added} new empty rows to fill).")
 
-    # Resume: keep responses already collected
-    done = {}
-    if os.path.exists(RESPONSES_FILE):
-        for r in read_csv(RESPONSES_FILE):
-            if r["response"] != "[ERROR]":
-                done[(r["prompt_id"], r["model"])] = r
 
-    rows = []
-    for p in prompts:
-        for cfg in MODELS:
-            k = (p["id"], cfg["name"])
-            if k in done:
-                rows.append(done[k])
-                continue
-            print(f"{p['id']} -> {cfg['name']}")
-            rows.append({"prompt_id": p["id"], "category": p["category"],
-                         "model": cfg["name"], "response": ask(cfg, p["prompt"], dry_run)})
-            write_csv(RESPONSES_FILE, rows, ["prompt_id", "category", "model", "response"])
+def missing_rows():
+    prompts = read_csv(PROMPTS_FILE)
+    resp = load_responses()
+    return [(p["id"], m) for m in MODELS for p in prompts
+            if not resp.get((p["id"], m), {}).get("response", "").strip()]
 
-    # Build blind pairs, random A/B order
-    rng = random.Random(SEED)
-    by_prompt = {}
-    for r in rows:
-        by_prompt.setdefault(r["prompt_id"], {})[r["model"]] = r["response"]
+
+def status():
+    miss = missing_rows()
+    total = len(read_csv(PROMPTS_FILE)) * len(MODELS)
+    print(f"Filled: {total - len(miss)}/{total}")
+    for m in MODELS:
+        ids = [pid for pid, mm in miss if mm == m]
+        if ids:
+            print(f"  {m}: missing {len(ids)} -> {', '.join(ids[:15])}{' ...' if len(ids) > 15 else ''}")
+
+
+def pairs():
+    miss = missing_rows()
+    if miss:
+        print(f"Still {len(miss)} empty responses. Run 'python run_models.py status' to see which.")
+        sys.exit(1)
+    prompts = read_csv(PROMPTS_FILE)
     pmap = {p["id"]: p for p in prompts}
+    resp = load_responses()
 
-    pairs, key = [], []
-    n = 0
-    for pid, resp in by_prompt.items():
-        for m1, m2 in itertools.combinations(sorted(resp), 2):
+    rng = random.Random(SEED)
+    out, key, n = [], [], 0
+    for p in prompts:
+        for m1, m2 in itertools.combinations(MODELS, 2):
             a, b = (m1, m2) if rng.random() < 0.5 else (m2, m1)
             n += 1
-            pair_id = f"P{n:03d}"
-            pairs.append({"pair_id": pair_id, "prompt_id": pid,
-                          "category": pmap[pid]["category"], "prompt": pmap[pid]["prompt"],
-                          "reference_answer": pmap[pid].get("reference_answer", ""),
-                          "response_a": resp[a], "response_b": resp[b],
-                          "human_winner": "", "human_reason": ""})
-            key.append({"pair_id": pair_id, "model_a": a, "model_b": b})
-    rng.shuffle(pairs)  # so you don't annotate the same prompt back to back
+            pid = p["id"]
+            out.append({"pair_id": f"P{n:03d}", "prompt_id": pid, "category": p["category"],
+                        "prompt": p["prompt"], "reference_answer": p.get("reference_answer", ""),
+                        "response_a": resp[(pid, a)]["response"],
+                        "response_b": resp[(pid, b)]["response"],
+                        "human_winner": "", "human_reason": ""})
+            key.append({"pair_id": f"P{n:03d}", "model_a": a, "model_b": b})
+    rng.shuffle(out)  # so you don't annotate the same prompt back to back
 
-    write_csv("pairs.csv", pairs, list(pairs[0].keys()))
+    if os.path.exists("pairs.csv") and any(r.get("human_winner") for r in read_csv("pairs.csv")):
+        print("pairs.csv already has annotations; rename or delete it first so you don't lose them.")
+        sys.exit(1)
+    write_csv("pairs.csv", out, list(out[0].keys()))
     write_csv("pairs_key.csv", key, ["pair_id", "model_a", "model_b"])
-    print(f"Done: {len(rows)} responses, {len(pairs)} pairs.")
+    print(f"Done: {len(out)} pairs. Annotate pairs.csv; don't open pairs_key.csv until you finish.")
 
 
 if __name__ == "__main__":
-    main()
+    cmd = sys.argv[1] if len(sys.argv) > 1 else ""
+    {"template": template, "status": status, "pairs": pairs}.get(
+        cmd, lambda: print(__doc__))()
